@@ -1,7 +1,7 @@
 
 # 🌍 AI Travel Planner Agent
 
-### Personalized Travel Planning with LLMs, RAG, LangChain, and Real-Time Search
+### Personalized Travel Planning with LLMs, RAG, LangChain Agent, and Real-Time Search
 
 An intelligent AI-powered travel planning assistant that generates personalized travel itineraries based on user preferences, travel requirements, and real-time information.
 
