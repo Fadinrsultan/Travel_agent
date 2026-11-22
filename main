@@ -1,0 +1,415 @@
+import os
+import json
+import requests
+import tkinter as tk
+from tkinter import filedialog
+
+import resend
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+
+# ============================================================
+# API KEYS
+# ============================================================
+
+OPENAI_API_KEY = "xxxx"
+
+SERPAPI_API_KEY = "xxxb"
+
+RESEND_API_KEY = ("xxxxc")
+
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+resend.api_key = RESEND_API_KEY
+
+RESEND_FROM_EMAIL = "onboarding@resend.dev"
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0
+)
+
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small"
+)
+
+
+# ============================================================
+# GLOBALS
+# ============================================================
+
+vectorstore = None
+private_email = None
+
+
+# ============================================================
+# UPLOAD PROFILE PDF
+# ============================================================
+
+def upload_profile_pdf():
+
+    global vectorstore
+
+    root = tk.Tk()
+    root.withdraw()
+
+    pdf_path = filedialog.askopenfilename(
+        title="Select Traveler Profile PDF",
+        filetypes=[("PDF files", "*.pdf")]
+    )
+
+    root.destroy()
+
+    if not pdf_path:
+        print("No PDF selected.")
+        return False
+
+    print("\nSelected PDF:")
+    print(pdf_path)
+
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100
+    )
+
+    documents = splitter.split_documents(docs)
+
+    vectorstore = FAISS.from_documents(
+        documents,
+        embeddings
+    )
+
+    print("\nTraveler profile loaded successfully.")
+
+    return True
+
+
+# ============================================================
+# PROFILE RETRIEVER
+# ============================================================
+
+@tool
+def traveler_profile_search(question: str) -> str:
+
+    """
+    Search the uploaded traveler profile PDF.
+    """
+
+    global vectorstore
+
+    if vectorstore is None:
+        return "No traveler profile loaded."
+
+    documents = vectorstore.similarity_search(
+        question,
+        k=4
+    )
+
+    return "\n\n".join(
+        document.page_content
+        for document in documents
+    )
+
+
+# ============================================================
+# SERPAPI
+# ============================================================
+
+def serpapi_request(parameters):
+
+    parameters["api_key"] = SERPAPI_API_KEY
+
+    response = requests.get(
+        "https://serpapi.com/search.json",
+        params=parameters,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "error" in data:
+        raise Exception(data["error"])
+
+    return data
+
+
+# ============================================================
+# HOTEL SEARCH
+# ============================================================
+
+@tool
+def search_hotels(
+    destination: str,
+    check_in_date: str,
+    check_out_date: str,
+    adults: int = 2,
+    max_price: int = 200
+) -> str:
+
+    """
+    Search current hotels and prices using Google Hotels.
+    Dates must use YYYY-MM-DD.
+    """
+
+    parameters = {
+        "engine": "google_hotels",
+        "q": destination,
+        "check_in_date": check_in_date,
+        "check_out_date": check_out_date,
+        "adults": adults,
+        "currency": "EUR",
+        "max_price": max_price,
+        "hl": "en",
+        "gl": "de"
+    }
+
+    try:
+
+        data = serpapi_request(parameters)
+
+        hotels = []
+
+        for hotel in data.get("properties", [])[:8]:
+
+            hotels.append({
+                "name": hotel.get("name"),
+                "hotel_class": hotel.get("hotel_class"),
+                "rating": hotel.get("overall_rating"),
+                "reviews": hotel.get("reviews"),
+                "price": hotel.get("rate_per_night"),
+                "total_price": hotel.get("total_rate"),
+                "description": hotel.get("description"),
+                "amenities": hotel.get("amenities", [])[:10]
+            })
+
+        return json.dumps(
+            hotels,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    except Exception as error:
+
+        return f"Hotel search error: {error}"
+
+
+# ============================================================
+# GENERAL INTERNET SEARCH
+# ============================================================
+
+@tool
+def search_internet(query: str) -> str:
+
+    """
+    Search current web information.
+    """
+
+    try:
+
+        data = serpapi_request({
+            "engine": "google",
+            "q": query,
+            "num": 5,
+            "hl": "en"
+        })
+
+        results = []
+
+        for item in data.get(
+            "organic_results",
+            []
+        )[:5]:
+
+            results.append({
+                "title": item.get("title"),
+                "link": item.get("link"),
+                "snippet": item.get("snippet")
+            })
+
+        return json.dumps(
+            results,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    except Exception as error:
+
+        return f"Search error: {error}"
+
+
+# ============================================================
+# AGENT
+# ============================================================
+
+tools = [
+    traveler_profile_search,
+    search_hotels,
+    search_internet
+]
+
+
+agent = create_agent(
+    model=llm,
+    tools=tools,
+    system_prompt="""
+You are a personal AI travel planner.
+
+A traveler profile PDF has been uploaded.
+
+For every personalized travel request:
+
+1. First use traveler_profile_search.
+2. Use search_hotels for current hotel prices.
+3. Use search_internet when current travel information is needed.
+
+Use the profile to respect:
+- budget
+- hotel budget
+- interests
+- hotel preferences
+- food preferences
+- transport preferences
+- flight preferences
+- special requirements
+
+Never invent current prices or availability.
+
+Produce a clear travel plan that can be sent by email.
+
+Include when relevant:
+- destination summary
+- recommended hotels
+- prices
+- why each hotel fits the profile
+- attractions
+- transportation advice
+- food considerations
+- practical recommendations
+"""
+)
+
+
+# ============================================================
+# SEND PLAN TO PRIVATE EMAIL
+# ============================================================
+
+def send_plan_email(
+    email_address,
+    plan
+):
+
+    result = resend.Emails.send({
+        "from": RESEND_FROM_EMAIL,
+        "to": [email_address],
+        "subject": "Your AI Travel Plan",
+        "text": plan
+    })
+
+    return result
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    global private_email
+
+    # 1. Upload PDF
+
+    uploaded = upload_profile_pdf()
+
+    if not uploaded:
+        return
+
+
+    # 2. Enter private email
+
+    private_email = input(
+        "\nEnter your private email address: "
+    ).strip()
+
+
+    # 3. Enter trip request
+
+    print(
+        "\nExample:"
+        "\nPlan a trip to Paris from "
+        "2026-12-10 to 2026-12-13."
+    )
+
+    trip_request = input(
+        "\nWhat trip would you like me to plan?\n> "
+    )
+
+
+    print("\nCreating your travel plan...")
+
+
+    # 4. Agent creates plan
+
+    result = agent.invoke({
+        "messages": [
+            {
+                "role": "user",
+                "content": trip_request
+            }
+        ]
+    })
+
+
+    plan = result["messages"][-1].content
+
+
+    print("\n================================")
+    print("TRAVEL PLAN")
+    print("================================\n")
+
+    print(plan)
+
+
+    # 5. Send final result to private email
+
+    try:
+
+        email_result = send_plan_email(
+            private_email,
+            plan
+        )
+
+        print(
+            f"\nTravel plan sent successfully "
+            f"to {private_email}."
+        )
+
+        print(email_result)
+
+    except Exception as error:
+
+        print(
+            f"\nCould not send email: {error}"
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+    main()
